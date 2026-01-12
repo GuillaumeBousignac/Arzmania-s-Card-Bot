@@ -1,0 +1,18 @@
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    last_loot TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS cards (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT,
+    rarity TEXT,
+    image_url TEXT
+);
+
+CREATE TABLE IF NOT EXISTS user_cards (
+    user_id INTEGER,
+    card_id INTEGER,
+    quantity INTEGER,
+    PRIMARY KEY (user_id, card_id)
+);
