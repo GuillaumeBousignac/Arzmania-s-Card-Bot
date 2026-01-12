@@ -13,7 +13,7 @@ load_dotenv()
 
 start_time = datetime.now(timezone.utc)
 
-BOT_VERSION = "0.6.1"
+BOT_VERSION = "0.7.0"
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 COOLDOWN_HOURS = 2
@@ -74,7 +74,9 @@ async def on_ready():
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INT PRIMARY KEY,
-                last_loot TEXT
+                last_loot TEXT,
+                loot_count INT DEFAULT 0,
+                favorite_card INT
             )
         """)
         await db.execute("""
@@ -93,6 +95,18 @@ async def on_ready():
                 PRIMARY KEY (user_id, card_id)
             )
         """)
+        
+        # Add columns if they don't exist (for existing databases)
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN loot_count INT DEFAULT 0")
+        except:
+            pass
+        
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN favorite_card INT")
+        except:
+            pass
+        
         await db.commit()
 
         async with db.execute("SELECT id, name, rarity, image_url FROM cards") as cursor:
@@ -184,8 +198,8 @@ async def loot(interaction: discord.Interaction):
         card = get_loot(cards_cache)
 
         await db.execute(
-            "INSERT OR REPLACE INTO users(user_id, last_loot) VALUES (?, ?)",
-            (user_id, now.isoformat())
+            "INSERT OR REPLACE INTO users(user_id, last_loot, loot_count) VALUES (?, ?, COALESCE((SELECT loot_count FROM users WHERE user_id = ?), 0) + 1)",
+            (user_id, now.isoformat(), user_id)
         )
         await db.execute("""
             INSERT INTO user_cards(user_id, card_id, quantity)
@@ -479,6 +493,222 @@ async def list_cards(interaction: discord.Interaction):
     embed.set_footer(text=f"Collection totale: {owned_total}/{total_cards} cartes ({overall_completion:.1f}%)")
 
     await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(
+    name="profile",
+    description="Afficher ton profil de collectionneur"
+)
+async def profile(interaction: discord.Interaction):
+    user_id = interaction.user.id
+
+    async with aiosqlite.connect("db.sqlite") as db:
+        # Get user stats
+        async with db.execute(
+            "SELECT loot_count, favorite_card FROM users WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            user_row = await cursor.fetchone()
+        
+        loot_count = user_row[0] if user_row and user_row[0] else 0
+        favorite_card_id = user_row[1] if user_row and user_row[1] else None
+        
+        # Get total cards owned
+        async with db.execute(
+            "SELECT SUM(quantity) FROM user_cards WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            total_cards_row = await cursor.fetchone()
+        
+        total_cards = total_cards_row[0] if total_cards_row[0] else 0
+        
+        # Get unique cards owned
+        async with db.execute(
+            "SELECT COUNT(DISTINCT card_id) FROM user_cards WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            unique_cards_row = await cursor.fetchone()
+        
+        unique_cards = unique_cards_row[0] if unique_cards_row[0] else 0
+        
+        # Get total cards in database
+        async with db.execute("SELECT COUNT(*) FROM cards") as cursor:
+            total_db_cards_row = await cursor.fetchone()
+        
+        total_db_cards = total_db_cards_row[0] if total_db_cards_row[0] else 1
+        
+        # Calculate completion percentage
+        completion = (unique_cards / total_db_cards * 100) if total_db_cards > 0 else 0
+        
+        # Get rarest card owned (ordered by rarity)
+        rarity_order = {
+            "???": 1,
+            "LR": 2,
+            "UR": 3,
+            "SSR": 4,
+            "SR": 5,
+            "R": 6,
+            "C": 7
+        }
+        
+        async with db.execute(
+            """
+            SELECT c.name, c.rarity
+            FROM user_cards uc
+            JOIN cards c ON uc.card_id = c.id
+            WHERE uc.user_id = ?
+            ORDER BY
+                CASE c.rarity
+                    WHEN '???' THEN 1
+                    WHEN 'LR' THEN 2
+                    WHEN 'UR' THEN 3
+                    WHEN 'SSR' THEN 4
+                    WHEN 'SR' THEN 5
+                    WHEN 'R' THEN 6
+                    WHEN 'C' THEN 7
+                    ELSE 8
+                END
+            LIMIT 1
+            """,
+            (user_id,)
+        ) as cursor:
+            rarest_row = await cursor.fetchone()
+        
+        rarest_card = f"{rarest_row[0]} ({rarest_row[1]})" if rarest_row else "Aucune"
+        
+        # Get favorite card
+        favorite_card_name = "Aucune"
+        if favorite_card_id:
+            async with db.execute(
+                "SELECT name, rarity FROM cards WHERE id = ?",
+                (favorite_card_id,)
+            ) as cursor:
+                fav_row = await cursor.fetchone()
+            
+            if fav_row:
+                favorite_card_name = f"{fav_row[0]} ({fav_row[1]})"
+    
+    embed = discord.Embed(
+        title=f"📊 Profil de {interaction.user.display_name}",
+        color=0xe74c3c
+    )
+    
+    embed.add_field(
+        name="📦 Total de cartes",
+        value=f"{total_cards} cartes",
+        inline=True
+    )
+    
+    embed.add_field(
+        name="📚 Collection",
+        value=f"{unique_cards}/{total_db_cards} ({completion:.1f}%)",
+        inline=True
+    )
+    
+    embed.add_field(
+        name="🎰 Loots effectués",
+        value=f"{loot_count}",
+        inline=True
+    )
+    
+    embed.add_field(
+        name="💎 Carte la plus rare",
+        value=rarest_card,
+        inline=False
+    )
+    
+    embed.add_field(
+        name="⭐ Carte favorite",
+        value=favorite_card_name,
+        inline=False
+    )
+    
+    embed.set_thumbnail(url=interaction.user.display_avatar.url)
+    embed.set_footer(text="Utilise /fav pour définir ta carte favorite")
+    
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(
+    name="fav",
+    description="Définir ta carte favorite"
+)
+@app_commands.describe(card_name="Nom de la carte (utilise l'autocomplétion)")
+async def fav(interaction: discord.Interaction, card_name: str):
+    user_id = interaction.user.id
+    
+    async with aiosqlite.connect("db.sqlite") as db:
+        # Check if card exists and user owns it
+        async with db.execute(
+            """
+            SELECT c.id, c.name, c.rarity
+            FROM cards c
+            JOIN user_cards uc ON c.id = uc.card_id
+            WHERE uc.user_id = ? AND LOWER(c.name) = LOWER(?)
+            """,
+            (user_id, card_name)
+        ) as cursor:
+            card_row = await cursor.fetchone()
+        
+        if not card_row:
+            await interaction.response.send_message(
+                "❌ Tu ne possèdes pas cette carte",
+                ephemeral=True
+            )
+            return
+        
+        card_id, actual_name, rarity = card_row
+        
+        # Update favorite card
+        await db.execute(
+            "UPDATE users SET favorite_card = ? WHERE user_id = ?",
+            (card_id, user_id)
+        )
+        
+        # If user doesn't exist yet, insert them
+        await db.execute(
+            "INSERT OR IGNORE INTO users(user_id, favorite_card) VALUES (?, ?)",
+            (user_id, card_id)
+        )
+        
+        await db.commit()
+    
+    await interaction.response.send_message(
+        f"⭐ **{actual_name}** ({rarity}) est maintenant ta carte favorite !"
+    )
+
+@fav.autocomplete('card_name')
+async def fav_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    """Autocomplete pour afficher uniquement les cartes que le joueur possède"""
+    user_id = interaction.user.id
+    
+    async with aiosqlite.connect("db.sqlite") as db:
+        async with db.execute(
+            """
+            SELECT c.name, c.rarity, uc.quantity
+            FROM user_cards uc
+            JOIN cards c ON uc.card_id = c.id
+            WHERE uc.user_id = ? AND uc.quantity > 0
+            ORDER BY c.name ASC
+            """, (user_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+    
+    # Filter based on what user is typing
+    matches = [
+        (name, rarity, qty) for name, rarity, qty in rows
+        if current.lower() in name.lower()
+    ]
+    
+    # Return up to 25 choices (Discord limit)
+    return [
+        app_commands.Choice(
+            name=f"{name} ({rarity})",
+            value=name
+        )
+        for name, rarity, qty in matches[:25]
+    ]
 
 @bot.tree.command(name="give", description="Donner une carte à un joueur")
 @app_commands.describe(
