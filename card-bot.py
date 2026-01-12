@@ -13,7 +13,7 @@ load_dotenv()
 
 start_time = datetime.now(timezone.utc)
 
-BOT_VERSION = "0.4.1"
+BOT_VERSION = "0.6.1"
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 COOLDOWN_HOURS = 2
