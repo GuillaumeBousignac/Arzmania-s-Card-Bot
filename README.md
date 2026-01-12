@@ -55,6 +55,8 @@ To see all the commands avaible, you can do the **/help** command :
 - **/show** <name> — Display a card in your inventory
 - **/inv** — Display your inventory
 - **/list** — Display all the cards in the game with the progression
+- **/profile** — Show your profile or someone else profile
+- **/fav** — Define your favorite card
 - **/give** <member> <card_name> — Give a card to a player
 
 👑​ **Admin :**

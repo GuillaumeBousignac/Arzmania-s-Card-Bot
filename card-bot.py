@@ -13,7 +13,7 @@ load_dotenv()
 
 start_time = datetime.now(timezone.utc)
 
-BOT_VERSION = "0.7.0"
+BOT_VERSION = "0.7.3"
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 COOLDOWN_HOURS = 2
@@ -496,10 +496,16 @@ async def list_cards(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="profile",
-    description="Afficher ton profil de collectionneur"
+    description="Afficher ton profil de collectionneur ou celui d'un autre joueur"
 )
-async def profile(interaction: discord.Interaction):
-    user_id = interaction.user.id
+@app_commands.describe(member="Le joueur dont tu veux voir le profil (optionnel)")
+async def profile(interaction: discord.Interaction, member: discord.Member = None):
+    # Defer response to prevent timeout
+    await interaction.response.defer()
+    
+    # If no member specified, show own profile
+    target = member or interaction.user
+    user_id = target.id
 
     async with aiosqlite.connect("db.sqlite") as db:
         # Get user stats
@@ -588,7 +594,7 @@ async def profile(interaction: discord.Interaction):
                 favorite_card_name = f"{fav_row[0]} ({fav_row[1]})"
     
     embed = discord.Embed(
-        title=f"📊 Profil de {interaction.user.display_name}",
+        title=f"📊 Profil de {target.display_name}",
         color=0xe74c3c
     )
     
@@ -622,10 +628,15 @@ async def profile(interaction: discord.Interaction):
         inline=False
     )
     
-    embed.set_thumbnail(url=interaction.user.display_avatar.url)
-    embed.set_footer(text="Utilise /fav pour définir ta carte favorite")
+    embed.set_thumbnail(url=target.display_avatar.url)
     
-    await interaction.response.send_message(embed=embed)
+    # Different footer based on whose profile is being viewed
+    if target.id == interaction.user.id:
+        embed.set_footer(text="Utilise /fav pour définir ta carte favorite")
+    else:
+        embed.set_footer(text=f"Profil consulté par {interaction.user.display_name}")
+    
+    await interaction.followup.send(embed=embed)
 
 @bot.tree.command(
     name="fav",
