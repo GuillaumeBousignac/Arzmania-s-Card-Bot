@@ -13,7 +13,7 @@ load_dotenv()
 
 start_time = datetime.now(timezone.utc)
 
-BOT_VERSION = "0.5.1"
+BOT_VERSION = "0.4.1"
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 COOLDOWN_HOURS = 2
@@ -357,6 +357,126 @@ async def inv(interaction: discord.Interaction):
         description="\n".join(lines),
         color=0x2ecc71
     )
+
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(
+    name="list",
+    description="Afficher toutes les cartes du jeu avec ta progression"
+)
+async def list_cards(interaction: discord.Interaction):
+    user_id = interaction.user.id
+
+    async with aiosqlite.connect("db.sqlite") as db:
+        # Get all cards from database
+        async with db.execute("""
+            SELECT c.id, c.name, c.rarity
+            FROM cards c
+            ORDER BY
+                CASE c.rarity
+                    WHEN '???' THEN 1
+                    WHEN 'LR' THEN 2 
+                    WHEN 'UR' THEN 3
+                    WHEN 'SSR' THEN 4
+                    WHEN 'SR' THEN 5
+                    WHEN 'R' THEN 6
+                    WHEN 'C' THEN 7
+                    ELSE 8
+                END,
+                c.name ASC
+        """) as cursor:
+            all_cards = await cursor.fetchall()
+
+        # Get user's owned cards
+        async with db.execute("""
+            SELECT card_id, quantity
+            FROM user_cards
+            WHERE user_id = ?
+        """, (user_id,)) as cursor:
+            owned_cards = {row[0]: row[1] for row in await cursor.fetchall()}
+
+    if not all_cards:
+        await interaction.response.send_message(
+            "📭 Aucune carte dans la base de données.",
+            ephemeral=True
+        )
+        return
+
+    rarity_titles = {
+        "???": "​♾️​ **SECRET**",
+        "LR": "🟨 **LR**",
+        "UR": "🟥 **UR**",
+        "SSR": "🟪 **SSR**",
+        "SR": "🟦 **SR**",
+        "R": "🟩​ **R**",
+        "C": "⬜ **C**"
+    }
+
+    rarity_emojis = {
+        "???": "​♾️​",
+        "LR": "🟨",
+        "UR": "🟥​",
+        "SSR": "🟪",
+        "SR": "🟦",
+        "R": "🟩​",
+        "C": "⬜"
+    }
+
+    lines = []
+    last_rarity = None
+    
+    # Track completion per rarity
+    rarity_stats = {}
+
+    for card_id, name, rarity in all_cards:
+        # Initialize rarity stats if needed
+        if rarity not in rarity_stats:
+            rarity_stats[rarity] = {"total": 0, "owned": 0}
+        
+        rarity_stats[rarity]["total"] += 1
+        
+        # Add rarity header
+        if rarity != last_rarity:
+            if last_rarity is not None:
+                lines.append("")
+            
+            # Add completion percentage for previous rarity
+            if last_rarity and last_rarity in rarity_stats:
+                stats = rarity_stats[last_rarity]
+                completion = (stats["owned"] / stats["total"] * 100) if stats["total"] > 0 else 0
+                lines[-1] = f"{lines[-1]} [{stats['owned']}/{stats['total']} - {completion:.0f}%]"
+            
+            lines.append(rarity_titles.get(rarity, "❓ **AUTRES**"))
+            lines.append("═══════════════════╢")
+            last_rarity = rarity
+
+        # Check if user owns this card
+        if card_id in owned_cards:
+            qty = owned_cards[card_id]
+            lines.append(f"{rarity_emojis.get(rarity, '❓')} {name} × {qty}")
+            rarity_stats[rarity]["owned"] += 1
+        else:
+            lines.append(f"{rarity_emojis.get(rarity, '❓')} ??? (Non possédée)")
+
+    # Add completion for last rarity
+    if last_rarity and last_rarity in rarity_stats:
+        stats = rarity_stats[last_rarity]
+        completion = (stats["owned"] / stats["total"] * 100) if stats["total"] > 0 else 0
+        lines.append("")
+        lines.append(f"Progression: {stats['owned']}/{stats['total']} ({completion:.0f}%)")
+
+    # Calculate overall completion
+    total_cards = sum(stats["total"] for stats in rarity_stats.values())
+    owned_total = sum(stats["owned"] for stats in rarity_stats.values())
+    overall_completion = (owned_total / total_cards * 100) if total_cards > 0 else 0
+
+    embed = discord.Embed(
+        title=f"📋 Collection complète - {interaction.user.display_name}",
+        description="\n".join(lines),
+        color=0xe67e22
+    )
+    
+    embed.set_footer(text=f"Collection totale: {owned_total}/{total_cards} cartes ({overall_completion:.1f}%)")
 
     await interaction.response.send_message(embed=embed)
 
