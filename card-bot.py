@@ -13,7 +13,7 @@ load_dotenv()
 
 start_time = datetime.now(timezone.utc)
 
-BOT_VERSION = "0.8.3"
+BOT_VERSION = "0.4.1"
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 COOLDOWN_HOURS = 2
@@ -277,7 +277,8 @@ async def help(interaction: discord.Interaction):
         "addcard",
         "delcard",
         "givecard",
-        "status"
+        "status",
+        "backup"
     }
 
     for cmd in bot.tree.get_commands():
@@ -1791,5 +1792,68 @@ async def givecard_autocomplete(
         )
         for name, rarity in matches[:25]
     ]
+
+@bot.tree.command(
+    name="backup",
+    description="Créer une sauvegarde de la base de données"
+)
+@app_commands.checks.has_permissions(administrator=True)
+async def backup(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    
+    import shutil
+    from datetime import datetime
+    
+    # Create backup filename with timestamp
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    backup_filename = f"backup_db_{timestamp}.sqlite"
+    backup_path = f"/tmp/{backup_filename}"
+    
+    try:
+        # Copy the database file
+        shutil.copy2("db.sqlite", backup_path)
+        
+        # Send the file
+        file = discord.File(backup_path, filename=backup_filename)
+        
+        embed = discord.Embed(
+            title="💾 Sauvegarde de la base de données",
+            description=f"Sauvegarde créée avec succès !\n**Fichier :** {backup_filename}",
+            color=0x2ecc71,
+            timestamp=datetime.now(timezone.utc)
+        )
+        
+        # Get database stats
+        async with aiosqlite.connect("db.sqlite") as db:
+            async with db.execute("SELECT COUNT(*) FROM cards") as cursor:
+                card_count = (await cursor.fetchone())[0]
+            
+            async with db.execute("SELECT COUNT(*) FROM users") as cursor:
+                user_count = (await cursor.fetchone())[0]
+            
+            async with db.execute("SELECT COUNT(*) FROM duel_history") as cursor:
+                duel_count = (await cursor.fetchone())[0]
+        
+        embed.add_field(
+            name="📊 Statistiques",
+            value=f"**Cartes :** {card_count}\n**Utilisateurs :** {user_count}\n**Historique de duels :** {duel_count}",
+            inline=False
+        )
+        
+        embed.set_footer(text=f"Sauvegarde créée par {interaction.user.display_name}")
+        
+        await interaction.followup.send(embed=embed, file=file, ephemeral=True)
+        
+        # Clean up temporary file
+        import os
+        os.remove(backup_path)
+        
+    except Exception as e:
+        await interaction.followup.send(
+            f"❌ Erreur lors de la création de la sauvegarde : {str(e)}",
+            ephemeral=True
+        )
+
+backup.error(admin_error)
 
 bot.run(TOKEN)
