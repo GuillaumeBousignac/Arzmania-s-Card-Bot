@@ -88,3 +88,20 @@ Rarity affects the probability of looting a card :
 | UR | 4% |
 | LR | 0,9% |
 | ??? | 0,1% |
+
+### Fighting System :
+
+**How it works :**
+
+Round 1: Pure Power comparison → Higher wins
+Round 2: Pure Protection comparison → Higher wins
+Round 3: (Power + Protection) total → Higher wins
+Best of 3 rounds wins the duel
+
+**Example :**
+
+Card A: Power 6, Protection 2 (Total: 8)
+Card B: Power 4, Protection 4 (Total: 8)
+Round 1: A wins (6 > 4)
+Round 2: B wins (4 > 2)
+Round 3: Draw (8 = 8) → Coin flip or random

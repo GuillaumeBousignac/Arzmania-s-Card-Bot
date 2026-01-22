@@ -13,7 +13,7 @@ load_dotenv()
 
 start_time = datetime.now(timezone.utc)
 
-BOT_VERSION = "0.7.3"
+BOT_VERSION = "0.8.3"
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 COOLDOWN_HOURS = 2
@@ -84,7 +84,9 @@ async def on_ready():
                 id INT PRIMARY KEY AUTOINCREMENT,
                 name TEXT,
                 rarity TEXT,
-                image_url TEXT
+                image_url TEXT,
+                power INT DEFAULT 1,
+                protection INT DEFAULT 1
             )
         """)
         await db.execute("""
@@ -93,6 +95,17 @@ async def on_ready():
                 card_id INT,
                 quantity INT,
                 PRIMARY KEY (user_id, card_id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS duel_history (
+                player1_id INT,
+                player2_id INT,
+                player1_wins INT DEFAULT 0,
+                player2_wins INT DEFAULT 0,
+                total_duels INT DEFAULT 0,
+                last_duel TEXT,
+                PRIMARY KEY (player1_id, player2_id)
             )
         """)
         
@@ -107,11 +120,21 @@ async def on_ready():
         except:
             pass
         
+        try:
+            await db.execute("ALTER TABLE cards ADD COLUMN power INT DEFAULT 1")
+        except:
+            pass
+        
+        try:
+            await db.execute("ALTER TABLE cards ADD COLUMN protection INT DEFAULT 1")
+        except:
+            pass
+        
         await db.commit()
 
-        async with db.execute("SELECT id, name, rarity, image_url FROM cards") as cursor:
+        async with db.execute("SELECT id, name, rarity, image_url, power, protection FROM cards") as cursor:
             rows = await cursor.fetchall()
-        cards_cache = [{"id": r[0], "name": r[1], "rarity": r[2], "image_url": r[3]} for r in rows]
+        cards_cache = [{"id": r[0], "name": r[1], "rarity": r[2], "image_url": r[3], "power": r[4], "protection": r[5]} for r in rows]
 
     print(f"Bot prêt ! Connecté en tant que {bot.user}")
 
@@ -121,6 +144,122 @@ async def admin_error(interaction: discord.Interaction, error):
             "❌ Tu n'as pas la permission d'utiliser cette commande.",
             ephemeral=True
         )
+
+def calculate_duel_winner(card1, card2):
+    """
+    Best of 3 rounds combat system:
+    Round 1: Pure Power comparison
+    Round 2: Pure Protection comparison  
+    Round 3: Total (Power + Protection)
+    Returns: (winner, rounds_details)
+    """
+    rounds = []
+    card1_wins = 0
+    card2_wins = 0
+    
+    # Round 1: Power comparison
+    if card1['power'] > card2['power']:
+        rounds.append({
+            'round': 1,
+            'type': 'Power',
+            'winner': 1,
+            'card1_stat': card1['power'],
+            'card2_stat': card2['power']
+        })
+        card1_wins += 1
+    elif card2['power'] > card1['power']:
+        rounds.append({
+            'round': 1,
+            'type': 'Power',
+            'winner': 2,
+            'card1_stat': card1['power'],
+            'card2_stat': card2['power']
+        })
+        card2_wins += 1
+    else:
+        rounds.append({
+            'round': 1,
+            'type': 'Power',
+            'winner': 0,
+            'card1_stat': card1['power'],
+            'card2_stat': card2['power']
+        })
+    
+    # Round 2: Protection comparison
+    if card1['protection'] > card2['protection']:
+        rounds.append({
+            'round': 2,
+            'type': 'Protection',
+            'winner': 1,
+            'card1_stat': card1['protection'],
+            'card2_stat': card2['protection']
+        })
+        card1_wins += 1
+    elif card2['protection'] > card1['protection']:
+        rounds.append({
+            'round': 2,
+            'type': 'Protection',
+            'winner': 2,
+            'card1_stat': card1['protection'],
+            'card2_stat': card2['protection']
+        })
+        card2_wins += 1
+    else:
+        rounds.append({
+            'round': 2,
+            'type': 'Protection',
+            'winner': 0,
+            'card1_stat': card1['protection'],
+            'card2_stat': card2['protection']
+        })
+    
+    # Round 3: Total stats comparison
+    total1 = card1['power'] + card1['protection']
+    total2 = card2['power'] + card2['protection']
+    
+    if total1 > total2:
+        rounds.append({
+            'round': 3,
+            'type': 'Total',
+            'winner': 1,
+            'card1_stat': total1,
+            'card2_stat': total2
+        })
+        card1_wins += 1
+    elif total2 > total1:
+        rounds.append({
+            'round': 3,
+            'type': 'Total',
+            'winner': 2,
+            'card1_stat': total1,
+            'card2_stat': total2
+        })
+        card2_wins += 1
+    else:
+        # Final tiebreaker: random
+        tiebreaker = random.choice([1, 2])
+        rounds.append({
+            'round': 3,
+            'type': 'Total (Égalité - Tirage au sort)',
+            'winner': tiebreaker,
+            'card1_stat': total1,
+            'card2_stat': total2
+        })
+        if tiebreaker == 1:
+            card1_wins += 1
+        else:
+            card2_wins += 1
+    
+    # Determine overall winner
+    if card1_wins > card2_wins:
+        overall_winner = 1
+    elif card2_wins > card1_wins:
+        overall_winner = 2
+    else:
+        # Should not happen with 3 rounds, but just in case
+        overall_winner = random.choice([1, 2])
+    
+    return overall_winner, rounds, card1_wins, card2_wins
 
 @bot.tree.command(name="help", description="Affiche la liste des commandes")
 async def help(interaction: discord.Interaction):
@@ -211,7 +350,7 @@ async def loot(interaction: discord.Interaction):
 
     embed = discord.Embed(
         title=card["name"],
-        description=f"Rareté : **{card['rarity']}**",
+        description=f"**Rareté :** {card['rarity']}\n⚔️ **Power :** {card['power']}/6\n🛡️ **Protection :** {card['protection']}/6",
         color=RARITY_COLORS.get(card["rarity"])
     )
 
@@ -232,7 +371,7 @@ async def show(interaction: discord.Interaction, name: str):
     async with aiosqlite.connect("db.sqlite") as db:
         async with db.execute(
             """
-            SELECT c.name, c.rarity, c.image_url, uc.quantity
+            SELECT c.name, c.rarity, c.image_url, uc.quantity, c.power, c.protection
             FROM user_cards uc
             JOIN cards c ON uc.card_id = c.id
             WHERE uc.user_id = ?
@@ -248,11 +387,11 @@ async def show(interaction: discord.Interaction, name: str):
         )
         return
     
-    card_name, rarity, image_url, quantity = row 
+    card_name, rarity, image_url, quantity, power, protection = row 
 
     embed = discord.Embed(
         title=card_name,
-        description=f"**Rareté :** {rarity}\n**Quantité :** {quantity}",
+        description=f"**Rareté :** {rarity}\n**Quantité :** {quantity}\n⚔️ **Power :** {power}/6\n🛡️ **Protection :** {protection}/6",
         color=RARITY_COLORS.get(rarity, 0x95a5a6)
     )
 
@@ -721,6 +860,409 @@ async def fav_autocomplete(
         for name, rarity, qty in matches[:25]
     ]
 
+@bot.tree.command(
+    name="duel",
+    description="Défier un autre joueur en duel de cartes !"
+)
+@app_commands.describe(
+    opponent="Le joueur que tu veux défier",
+    your_card="Ta carte pour le duel (utilise l'autocomplétion)",
+    opponent_card="La carte de ton adversaire (optionnel - il peut choisir)"
+)
+async def duel(
+    interaction: discord.Interaction,
+    opponent: discord.Member,
+    your_card: str,
+    opponent_card: str = None
+):
+    challenger_id = interaction.user.id
+    opponent_id = opponent.id
+    
+    # Can't duel yourself
+    if challenger_id == opponent_id:
+        await interaction.response.send_message(
+            "❌ Tu ne peux pas te défier toi-même !",
+            ephemeral=True
+        )
+        return
+    
+    # Can't duel bots
+    if opponent.bot:
+        await interaction.response.send_message(
+            "❌ Tu ne peux pas défier un bot !",
+            ephemeral=True
+        )
+        return
+    
+    async with aiosqlite.connect("db.sqlite") as db:
+        # Get challenger's card
+        async with db.execute(
+            """
+            SELECT c.id, c.name, c.rarity, c.power, c.protection, c.image_url
+            FROM cards c
+            JOIN user_cards uc ON c.id = uc.card_id
+            WHERE uc.user_id = ? AND LOWER(c.name) = LOWER(?)
+            """,
+            (challenger_id, your_card)
+        ) as cursor:
+            card1_data = await cursor.fetchone()
+        
+        if not card1_data:
+            await interaction.response.send_message(
+                f"❌ Tu ne possèdes pas la carte **{your_card}**",
+                ephemeral=True
+            )
+            return
+        
+        card1 = {
+            'id': card1_data[0],
+            'name': card1_data[1],
+            'rarity': card1_data[2],
+            'power': card1_data[3],
+            'protection': card1_data[4],
+            'image_url': card1_data[5]
+        }
+        
+        # Get opponent's card
+        if opponent_card:
+            async with db.execute(
+                """
+                SELECT c.id, c.name, c.rarity, c.power, c.protection, c.image_url
+                FROM cards c
+                JOIN user_cards uc ON c.id = uc.card_id
+                WHERE uc.user_id = ? AND LOWER(c.name) = LOWER(?)
+                """,
+                (opponent_id, opponent_card)
+            ) as cursor:
+                card2_data = await cursor.fetchone()
+            
+            if not card2_data:
+                await interaction.response.send_message(
+                    f"❌ {opponent.mention} ne possède pas la carte **{opponent_card}**",
+                    ephemeral=True
+                )
+                return
+            
+            card2 = {
+                'id': card2_data[0],
+                'name': card2_data[1],
+                'rarity': card2_data[2],
+                'power': card2_data[3],
+                'protection': card2_data[4],
+                'image_url': card2_data[5]
+            }
+        else:
+            # Random card from opponent's collection
+            async with db.execute(
+                """
+                SELECT c.id, c.name, c.rarity, c.power, c.protection, c.image_url
+                FROM cards c
+                JOIN user_cards uc ON c.id = uc.card_id
+                WHERE uc.user_id = ?
+                ORDER BY RANDOM()
+                LIMIT 1
+                """,
+                (opponent_id,)
+            ) as cursor:
+                card2_data = await cursor.fetchone()
+            
+            if not card2_data:
+                await interaction.response.send_message(
+                    f"❌ {opponent.mention} n'a aucune carte dans son inventaire !",
+                    ephemeral=True
+                )
+                return
+            
+            card2 = {
+                'id': card2_data[0],
+                'name': card2_data[1],
+                'rarity': card2_data[2],
+                'power': card2_data[3],
+                'protection': card2_data[4],
+                'image_url': card2_data[5]
+            }
+    
+    # Calculate duel result
+    winner, rounds, card1_wins, card2_wins = calculate_duel_winner(card1, card2)
+    
+    # Update duel history in database
+    async with aiosqlite.connect("db.sqlite") as db:
+        # Ensure consistent ordering (lower ID first)
+        if challenger_id < opponent_id:
+            p1_id, p2_id = challenger_id, opponent_id
+            p1_won = (winner == 1)
+        else:
+            p1_id, p2_id = opponent_id, challenger_id
+            p1_won = (winner == 2)
+        
+        # Get current history
+        async with db.execute(
+            "SELECT player1_wins, player2_wins, total_duels FROM duel_history WHERE player1_id = ? AND player2_id = ?",
+            (p1_id, p2_id)
+        ) as cursor:
+            history = await cursor.fetchone()
+        
+        if history:
+            p1_wins, p2_wins, total = history
+            if p1_won:
+                p1_wins += 1
+            else:
+                p2_wins += 1
+            total += 1
+            
+            await db.execute(
+                "UPDATE duel_history SET player1_wins = ?, player2_wins = ?, total_duels = ?, last_duel = ? WHERE player1_id = ? AND player2_id = ?",
+                (p1_wins, p2_wins, total, datetime.now(timezone.utc).isoformat(), p1_id, p2_id)
+            )
+        else:
+            # First duel between these players
+            p1_wins = 1 if p1_won else 0
+            p2_wins = 0 if p1_won else 1
+            total = 1
+            
+            await db.execute(
+                "INSERT INTO duel_history (player1_id, player2_id, player1_wins, player2_wins, total_duels, last_duel) VALUES (?, ?, ?, ?, ?, ?)",
+                (p1_id, p2_id, p1_wins, p2_wins, total, datetime.now(timezone.utc).isoformat())
+            )
+        
+        await db.commit()
+        
+        # Get updated stats for display
+        if challenger_id < opponent_id:
+            challenger_total_wins = p1_wins
+            opponent_total_wins = p2_wins
+        else:
+            challenger_total_wins = p2_wins
+            opponent_total_wins = p1_wins
+    
+    # Create result embed
+    embed = discord.Embed(
+        title="⚔️ DUEL DE CARTES ⚔️",
+        color=0xe74c3c if winner == 1 else 0x3498db
+    )
+    
+    # Combatants
+    embed.add_field(
+        name=f"🔴 {interaction.user.display_name}",
+        value=f"**{card1['name']}** ({card1['rarity']})\n⚔️ Power: {card1['power']}/6\n🛡️ Protection: {card1['protection']}/6",
+        inline=True
+    )
+    
+    embed.add_field(
+        name=f"🔵 {opponent.display_name}",
+        value=f"**{card2['name']}** ({card2['rarity']})\n⚔️ Power: {card2['power']}/6\n🛡️ Protection: {card2['protection']}/6",
+        inline=True
+    )
+    
+    embed.add_field(name="\u200b", value="\u200b", inline=False)
+    
+    # Round details
+    round_emojis = {1: "🥇", 2: "🥈", 3: "🥉"}
+    for round_info in rounds:
+        round_num = round_info['round']
+        round_type = round_info['type']
+        round_winner = round_info['winner']
+        
+        if round_winner == 0:
+            result = "⚖️ Égalité"
+        elif round_winner == 1:
+            result = f"🔴 {interaction.user.display_name} gagne"
+        else:
+            result = f"🔵 {opponent.display_name} gagne"
+        
+        embed.add_field(
+            name=f"{round_emojis[round_num]} Round {round_num}: {round_type}",
+            value=f"{round_info['card1_stat']} vs {round_info['card2_stat']}\n{result}",
+            inline=True
+        )
+    
+    embed.add_field(name="\u200b", value="\u200b", inline=False)
+    
+    # Final result with history
+    if winner == 1:
+        embed.add_field(
+            name="🏆 VAINQUEUR",
+            value=f"**{interaction.user.display_name}** remporte le duel {card1_wins}-{card2_wins} !\n\n📊 **Historique vs {opponent.display_name}:**\n{interaction.user.display_name}: {challenger_total_wins} victoires\n{opponent.display_name}: {opponent_total_wins} victoires\n*Total: {total} duels*",
+            inline=False
+        )
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+    else:
+        embed.add_field(
+            name="🏆 VAINQUEUR",
+            value=f"**{opponent.display_name}** remporte le duel {card2_wins}-{card1_wins} !\n\n📊 **Historique vs {interaction.user.display_name}:**\n{opponent.display_name}: {opponent_total_wins} victoires\n{interaction.user.display_name}: {challenger_total_wins} victoires\n*Total: {total} duels*",
+            inline=False
+        )
+        embed.set_thumbnail(url=opponent.display_avatar.url)
+    
+    await interaction.response.send_message(embed=embed)
+
+@duel.autocomplete('your_card')
+async def duel_your_card_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    """Autocomplete pour afficher les cartes du joueur"""
+    user_id = interaction.user.id
+    
+    async with aiosqlite.connect("db.sqlite") as db:
+        async with db.execute(
+            """
+            SELECT c.name, c.rarity, c.power, c.protection
+            FROM user_cards uc
+            JOIN cards c ON uc.card_id = c.id
+            WHERE uc.user_id = ? AND uc.quantity > 0
+            ORDER BY c.name ASC
+            """, (user_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+    
+    matches = [
+        (name, rarity, power, protection) for name, rarity, power, protection in rows
+        if current.lower() in name.lower()
+    ]
+    
+    return [
+        app_commands.Choice(
+            name=f"{name} ({rarity}) - ⚔️{power} 🛡️{protection}",
+            value=name
+        )
+        for name, rarity, power, protection in matches[:25]
+    ]
+
+@duel.autocomplete('opponent_card')
+async def duel_opponent_card_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    """Autocomplete pour afficher les cartes de l'adversaire si sélectionné"""
+    # Get the opponent parameter
+    namespace = interaction.namespace
+    opponent = namespace.opponent if hasattr(namespace, 'opponent') else None
+    
+    if not opponent:
+        return [app_commands.Choice(name="Sélectionne d'abord un adversaire", value="")]
+    
+    opponent_id = opponent.id
+    
+    async with aiosqlite.connect("db.sqlite") as db:
+        async with db.execute(
+            """
+            SELECT c.name, c.rarity, c.power, c.protection
+            FROM user_cards uc
+            JOIN cards c ON uc.card_id = c.id
+            WHERE uc.user_id = ? AND uc.quantity > 0
+            ORDER BY c.name ASC
+            """, (opponent_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+    
+    matches = [
+        (name, rarity, power, protection) for name, rarity, power, protection in rows
+        if current.lower() in name.lower()
+    ]
+    
+    return [
+        app_commands.Choice(
+            name=f"{name} ({rarity}) - ⚔️{power} 🛡️{protection}",
+            value=name
+        )
+        for name, rarity, power, protection in matches[:25]
+    ]
+
+@bot.tree.command(
+    name="duelstats",
+    description="Voir tes statistiques de duels ou celles d'un autre joueur"
+)
+@app_commands.describe(member="Le joueur dont tu veux voir les stats (optionnel)")
+async def duelstats(interaction: discord.Interaction, member: discord.Member = None):
+    target = member or interaction.user
+    user_id = target.id
+    
+    async with aiosqlite.connect("db.sqlite") as db:
+        # Get all duels where user is player1
+        async with db.execute(
+            """
+            SELECT player2_id, player1_wins, player2_wins, total_duels
+            FROM duel_history
+            WHERE player1_id = ?
+            """,
+            (user_id,)
+        ) as cursor:
+            as_player1 = await cursor.fetchall()
+        
+        # Get all duels where user is player2
+        async with db.execute(
+            """
+            SELECT player1_id, player2_wins, player1_wins, total_duels
+            FROM duel_history
+            WHERE player2_id = ?
+            """,
+            (user_id,)
+        ) as cursor:
+            as_player2 = await cursor.fetchall()
+    
+    # Combine and calculate totals
+    all_duels = as_player1 + as_player2
+    
+    if not all_duels:
+        await interaction.response.send_message(
+            f"📊 **{target.display_name}** n'a encore participé à aucun duel !",
+            ephemeral=True
+        )
+        return
+    
+    total_wins = sum(d[1] for d in all_duels)
+    total_losses = sum(d[2] for d in all_duels)
+    total_duels = sum(d[3] for d in all_duels)
+    win_rate = (total_wins / total_duels * 100) if total_duels > 0 else 0
+    
+    embed = discord.Embed(
+        title=f"⚔️ Statistiques de Duels - {target.display_name}",
+        color=0xf39c12
+    )
+    
+    embed.add_field(
+        name="📊 Statistiques Globales",
+        value=f"**Total de duels :** {total_duels}\n**Victoires :** {total_wins} 🏆\n**Défaites :** {total_losses} 💀\n**Taux de victoire :** {win_rate:.1f}%",
+        inline=False
+    )
+    
+    # Top 5 rivalries
+    rivalries = []
+    for opponent_id, wins, losses, total in all_duels:
+        try:
+            opponent = await bot.fetch_user(opponent_id)
+            rivalries.append({
+                'name': opponent.display_name,
+                'wins': wins,
+                'losses': losses,
+                'total': total
+            })
+        except:
+            continue
+    
+    if rivalries:
+        # Sort by total duels
+        rivalries.sort(key=lambda x: x['total'], reverse=True)
+        
+        rivalry_text = []
+        for i, rival in enumerate(rivalries[:5], 1):
+            rivalry_text.append(
+                f"**{i}. {rival['name']}**\n"
+                f"   {rival['wins']}W - {rival['losses']}L ({rival['total']} duels)"
+            )
+        
+        embed.add_field(
+            name="🎯 Top Rivalités",
+            value="\n".join(rivalry_text),
+            inline=False
+        )
+    
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.set_footer(text=f"Demandé par {interaction.user.display_name}")
+    
+    await interaction.response.send_message(embed=embed)
+
 @bot.tree.command(name="give", description="Donner une carte à un joueur")
 @app_commands.describe(
     member="Le joueur qui reçoit la carte",
@@ -1028,6 +1570,8 @@ RARITY_CHOICES = [
 @app_commands.describe(
     name="Nom de la carte",
     rarity="Rareté de la carte",
+    power="Niveau de puissance (1-6)",
+    protection="Niveau de protection (1-6)",
     image_url="URL de l'image (optionnel si vous joignez une image)",
     image_file="Fichier image à envoyer (optionnel si URL fournie)"
 )
@@ -1036,9 +1580,25 @@ async def addcard(
     interaction: discord.Interaction,
     name: str,
     rarity: app_commands.Choice[str],
+    power: int,
+    protection: int,
     image_url: str = None,
     image_file: discord.Attachment = None
 ):
+    # Validate power and protection levels
+    if not (1 <= power <= 6):
+        await interaction.response.send_message(
+            "❌ Le niveau de puissance doit être entre 1 et 6",
+            ephemeral=True
+        )
+        return
+    
+    if not (1 <= protection <= 6):
+        await interaction.response.send_message(
+            "❌ Le niveau de protection doit être entre 1 et 6",
+            ephemeral=True
+        )
+        return
 
     if image_file is not None:
         image_url_final = image_file.url
@@ -1049,24 +1609,24 @@ async def addcard(
 
     async with aiosqlite.connect("db.sqlite") as db:
         await db.execute(
-            "INSERT INTO cards (name, rarity, image_url) VALUES (?, ?, ?)",
-            (name, rarity.value, image_url_final)
+            "INSERT INTO cards (name, rarity, image_url, power, protection) VALUES (?, ?, ?, ?, ?)",
+            (name, rarity.value, image_url_final, power, protection)
         )
         await db.commit()
 
         global cards_cache
         async with db.execute(
-            "SELECT id, name, rarity, image_url FROM cards"
+            "SELECT id, name, rarity, image_url, power, protection FROM cards"
         ) as cursor:
             rows = await cursor.fetchall()
 
         cards_cache = [
-            {"id": r[0], "name": r[1], "rarity": r[2], "image_url": r[3]}
+            {"id": r[0], "name": r[1], "rarity": r[2], "image_url": r[3], "power": r[4], "protection": r[5]}
             for r in rows
         ]
 
     await interaction.response.send_message(
-        f"✅ Carte **{name}** ajoutée ({rarity.value})",
+        f"✅ Carte **{name}** ajoutée ({rarity.value}) - ⚔️ {power}/6 | 🛡️ {protection}/6",
         ephemeral=True
     )
 
@@ -1109,12 +1669,12 @@ async def delcard(interaction: discord.Interaction, name: str):
         # refresh cache
         global cards_cache
         async with db.execute(
-            "SELECT id, name, rarity, image_url FROM cards"
+            "SELECT id, name, rarity, image_url, power, protection FROM cards"
         ) as cursor:
             rows = await cursor.fetchall()
 
         cards_cache = [
-            {"id": r[0], "name": r[1], "rarity": r[2], "image_url": r[3]}
+            {"id": r[0], "name": r[1], "rarity": r[2], "image_url": r[3], "power": r[4], "protection": r[5]}
             for r in rows
         ]
 
