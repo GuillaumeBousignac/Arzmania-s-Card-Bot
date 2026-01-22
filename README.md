@@ -58,7 +58,7 @@ To see all the commands avaible, you can do the **/help** command :
 - **/profile** — Show your profile or someone else profile
 - **/fav** — Define your favorite card
 - **/duel** <opponent> <your_card> <opponent_card> — Challenge another player to a card duel !
-- **/duelstats** <member> — Show your duel's statistics or another player
+- **/duelstats** <member> — Show your duel statistics or another player
 - **/give** <member> <card_name> — Give a card to a player
 
 👑​ **Admin :**
