@@ -92,6 +92,8 @@ Rarity affects the probability of looting a card :
 | LR | 0,9% |
 | ??? | 0,1% |
 
+---
+
 ### Fighting System :
 
 **How it works :**
