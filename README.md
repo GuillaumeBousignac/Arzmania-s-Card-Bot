@@ -69,6 +69,7 @@ To see all the commands avaible, you can do the **/help** command :
 - **/delcard** <name> — Delete a card to the database
 - **/givecard** <name> — Give a card to your inventory
 - **/backup** — Create a save of the database
+- **/fixcardimage** — Fix the image of a card
 
 ---
 
