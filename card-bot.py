@@ -16,7 +16,7 @@ load_dotenv()
 
 start_time = datetime.now(timezone.utc)
 
-BOT_VERSION = "0.10.0"
+BOT_VERSION = "0.10.2"
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
@@ -51,7 +51,7 @@ RARITY_COLORS = {
 async def upload_image_to_github(image_data: bytes, filename: str) -> str | None:
     """
     Upload an image to the /cards/ folder of the GitHub repo.
-    Returns the permanent raw.githubusercontent.com URL, or None on failure.
+    Returns the permanent githubusercontent.com CDN URL, or None on failure.
     """
     safe_name = filename.replace(" ", "_")
     path = f"cards/{safe_name}"
@@ -80,6 +80,10 @@ async def upload_image_to_github(image_data: bytes, filename: str) -> str | None
         
         async with session.put(api_url, headers=headers, json=payload) as resp:
             if resp.status in (200, 201):
+                result = await resp.json()
+                download_url = result.get("content", {}).get("download_url")
+                if download_url:
+                    return download_url
                 return f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_BRANCH}/{path}"
             else:
                 error = await resp.text()
@@ -118,7 +122,6 @@ def calculate_duel_winner(card1, card2):
     card1_wins = 0
     card2_wins = 0
     
-    # Round 1: Power
     if card1['power'] > card2['power']:
         rounds.append({'round': 1, 'type': 'Power', 'winner': 1, 'card1_stat': card1['power'], 'card2_stat': card2['power']})
         card1_wins += 1
@@ -128,7 +131,6 @@ def calculate_duel_winner(card1, card2):
     else:
         rounds.append({'round': 1, 'type': 'Power', 'winner': 0, 'card1_stat': card1['power'], 'card2_stat': card2['power']})
     
-    # Round 2: Protection
     if card1['protection'] > card2['protection']:
         rounds.append({'round': 2, 'type': 'Protection', 'winner': 1, 'card1_stat': card1['protection'], 'card2_stat': card2['protection']})
         card1_wins += 1
@@ -138,7 +140,6 @@ def calculate_duel_winner(card1, card2):
     else:
         rounds.append({'round': 2, 'type': 'Protection', 'winner': 0, 'card1_stat': card1['protection'], 'card2_stat': card2['protection']})
     
-    # Round 3: Total
     total1 = card1['power'] + card1['protection']
     total2 = card2['power'] + card2['protection']
     
@@ -242,7 +243,7 @@ async def help(interaction: discord.Interaction):
     player_commands = []
     admin_commands = []
 
-    ADMIN_COMMANDS = {"db", "refresh", "addcard", "delcard", "givecard", "status", "backup", "fixcardimage"}
+    ADMIN_COMMANDS = {"db", "refresh", "addcard", "delcard", "givecard", "status", "backup", "fixcardimage", "refreshallimages"}
 
     for cmd in bot.tree.get_commands():
         cmd_name = cmd.name
@@ -743,6 +744,7 @@ async def give_autocomplete(interaction: discord.Interaction, current: str) -> l
     matches = [(n, r, q) for n, r, q in rows if current.lower() in n.lower()]
     return [app_commands.Choice(name=f"{n} ({r}) × {q}", value=n) for n, r, q in matches[:25]]
 
+
 @bot.tree.command(name="db", description="Afficher toutes les cartes disponibles du jeu")
 @app_commands.checks.has_permissions(administrator=True)
 async def db_cmd(interaction: discord.Interaction):
@@ -965,6 +967,59 @@ async def fixcardimage_autocomplete(interaction: discord.Interaction, current: s
     return [app_commands.Choice(name=f"{n} ({r})", value=n) for n, r in matches[:25]]
 
 
+@bot.tree.command(name="refreshallimages", description="Rafraîchir toutes les URLs d'images de cartes (fix Discord cache)")
+@app_commands.checks.has_permissions(administrator=True)
+async def refreshallimages(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        async with aiosqlite.connect("db.sqlite") as db:
+            async with db.execute("SELECT id, name, image_url FROM cards WHERE image_url != ''") as cursor:
+                cards = await cursor.fetchall()
+        
+        if not cards:
+            await interaction.followup.send("❌ Aucune carte avec image trouvée.", ephemeral=True)
+            return
+        
+        updated = 0
+        failed = []
+        
+        for card_id, name, old_url in cards:
+            if not old_url or "raw.githubusercontent.com" not in old_url:
+                continue
+            
+            import re
+            match = re.search(r'github\.com/[^/]+/[^/]+/[^/]+/(.+)$', old_url)
+            if match:
+                file_path = match.group(1)
+                new_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_BRANCH}/{file_path}?v={int(datetime.now(timezone.utc).timestamp())}"
+                
+                async with aiosqlite.connect("db.sqlite") as db:
+                    await db.execute("UPDATE cards SET image_url = ? WHERE id = ?", (new_url, card_id))
+                    await db.commit()
+                
+                updated += 1
+            else:
+                failed.append(name)
+        
+        async with aiosqlite.connect("db.sqlite") as db:
+            async with db.execute("SELECT id, name, rarity, image_url, power, protection FROM cards") as cursor:
+                rows = await cursor.fetchall()
+        global cards_cache
+        cards_cache = [{"id": r[0], "name": r[1], "rarity": r[2], "image_url": r[3], "power": r[4], "protection": r[5]} for r in rows]
+        
+        result_msg = f"✅ **{updated}** URLs d'images rafraîchies avec succès!"
+        if failed:
+            result_msg += f"\n⚠️ Impossible de rafraîchir: {', '.join(failed)}"
+        
+        await interaction.followup.send(result_msg, ephemeral=True)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ Erreur: {str(e)}", ephemeral=True)
+
+refreshallimages.error(admin_error)
+
+
 @bot.tree.command(name="delcard", description="Supprimer une carte de la base de données")
 @app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(name="Nom de la carte (utilise l'autocomplétion)")
@@ -1023,6 +1078,7 @@ async def givecard_autocomplete(interaction: discord.Interaction, current: str) 
             rows = await cursor.fetchall()
     matches = [(n, r) for n, r in rows if current.lower() in n.lower()]
     return [app_commands.Choice(name=f"{n} ({r})", value=n) for n, r in matches[:25]]
+
 
 @bot.tree.command(name="backup", description="Créer une sauvegarde de la base de données")
 @app_commands.checks.has_permissions(administrator=True)
