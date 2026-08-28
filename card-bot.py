@@ -16,13 +16,15 @@ load_dotenv()
 
 start_time = datetime.now(timezone.utc)
 
-BOT_VERSION = "0.10.2"
+BOT_VERSION = "1.1.0"
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GITHUB_REPO = os.getenv("GITHUB_REPO")
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
-COOLDOWN_HOURS = 2
+
+BASE_COOLDOWN_HOURS = 2
+BOOSTER_COOLDOWN_HOURS = 1
 
 if TOKEN is None:
     raise ValueError("Le token Discord n'est pas défini !")
@@ -230,11 +232,49 @@ async def on_ready():
     print(f"Bot prêt ! Connecté en tant que {bot.user}")
 
 async def admin_error(interaction: discord.Interaction, error):
+    original = getattr(error, "original", error)
+
+    if isinstance(original, discord.NotFound) and getattr(original, "code", None) == 10062:
+        cmd_name = interaction.command.name if interaction.command else "?"
+        print(f"[Interaction expirée] Commande admin '{cmd_name}' ignorée (token invalide, probablement une coupure réseau)")
+        return
+
     if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message(
-            "❌ Tu n'as pas la permission d'utiliser cette commande.",
-            ephemeral=True
-        )
+        try:
+            await interaction.response.send_message(
+                "❌ Tu n'as pas la permission d'utiliser cette commande.",
+                ephemeral=True
+            )
+        except discord.NotFound:
+            pass
+        return
+
+    print(f"[Erreur non gérée - commande admin] {original!r}")
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    original = getattr(error, "original", error)
+
+    if isinstance(original, discord.NotFound) and getattr(original, "code", None) == 10062:
+        cmd_name = interaction.command.name if interaction.command else "?"
+        print(f"[Interaction expirée] Commande '{cmd_name}' ignorée (token invalide, probablement une coupure réseau)")
+        return
+
+    if isinstance(error, app_commands.MissingPermissions):
+        try:
+            await interaction.response.send_message("❌ Tu n'as pas la permission d'utiliser cette commande.", ephemeral=True)
+        except discord.NotFound:
+            pass
+        return
+
+    print(f"[Erreur non gérée] {original!r}")
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send("❌ Une erreur est survenue.", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ Une erreur est survenue.", ephemeral=True)
+    except discord.NotFound:
+        pass
 
 @bot.tree.command(name="help", description="Affiche la liste des commandes")
 async def help(interaction: discord.Interaction):
@@ -271,14 +311,18 @@ async def loot(interaction: discord.Interaction):
     user_id = interaction.user.id
     now = datetime.now(timezone.utc)
 
+    # Cooldown réduit pour les boosters du serveur
+    is_booster = interaction.user.premium_since is not None
+    cooldown_hours = BOOSTER_COOLDOWN_HOURS if is_booster else BASE_COOLDOWN_HOURS
+
     async with aiosqlite.connect("db.sqlite") as db:
         async with db.execute("SELECT last_loot FROM users WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
 
         if row:
             last_loot = datetime.fromisoformat(row[0])
-            if now - last_loot < timedelta(hours=COOLDOWN_HOURS):
-                remaining = timedelta(hours=COOLDOWN_HOURS) - (now - last_loot)
+            if now - last_loot < timedelta(hours=cooldown_hours):
+                remaining = timedelta(hours=cooldown_hours) - (now - last_loot)
                 h, rem = divmod(int(remaining.total_seconds()), 3600)
                 m, s = divmod(rem, 60)
                 await interaction.response.send_message(f"⏳ Attends encore **{h}h {m}m {s}s**", ephemeral=True)
@@ -305,6 +349,8 @@ async def loot(interaction: discord.Interaction):
     )
     if card["image_url"]:
         embed.set_image(url=card["image_url"])
+    if is_booster:
+        embed.set_footer(text="💎 Cooldown réduit grâce à ton boost du serveur !")
     await interaction.response.send_message(embed=embed)
 
 
@@ -812,7 +858,7 @@ status.error(admin_error)
 async def refresh(interaction: discord.Interaction, member: discord.Member | None = None):
     target = member or interaction.user
     user_id = target.id
-    reset_time = (datetime.now(timezone.utc) - timedelta(hours=COOLDOWN_HOURS + 1)).isoformat()
+    reset_time = (datetime.now(timezone.utc) - timedelta(hours=BASE_COOLDOWN_HOURS + 1)).isoformat()
 
     async with aiosqlite.connect("db.sqlite") as db:
         async with db.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)) as cursor:
