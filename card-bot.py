@@ -16,7 +16,7 @@ load_dotenv()
 
 start_time = datetime.now(timezone.utc)
 
-BOT_VERSION = "1.1.0"
+BOT_VERSION = "1.2.0"
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
@@ -25,6 +25,7 @@ GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
 
 BASE_COOLDOWN_HOURS = 2
 BOOSTER_COOLDOWN_HOURS = 1
+DEFAULT_PITY_THRESHOLD = 15
 
 if TOKEN is None:
     raise ValueError("Le token Discord n'est pas défini !")
@@ -92,7 +93,15 @@ async def upload_image_to_github(image_data: bytes, filename: str) -> str | None
                 print(f"[GitHub Upload Error] {resp.status}: {error}")
                 return None
 
-def get_loot(cards):
+def get_loot(cards, boosts: dict | None = None):
+    """
+    Pick a random card.
+    `boosts` is an optional dict {card_id: multiplier} used by special
+    loot events: the overall rarity distribution is unchanged, but within
+    the chosen rarity's pool, boosted cards get picked more often.
+    """
+    boosts = boosts or {}
+
     rates = {
         "C": 0.35,
         "R": 0.30,
@@ -114,10 +123,80 @@ def get_loot(cards):
 
     candidates = [card for card in cards if card["rarity"] == rarity_selected]
     if not candidates:
+        if not cards:
+            return None
         return random.choice(cards)
-    
-    random.shuffle(candidates)
-    return candidates[0]
+
+    if not boosts:
+        random.shuffle(candidates)
+        return candidates[0]
+
+    weights = [boosts.get(card["id"], 1.0) for card in candidates]
+    return random.choices(candidates, weights=weights, k=1)[0]
+
+
+async def _reset_pity(db: aiosqlite.Connection, user_id: int, event_id: int):
+    await db.execute("""
+        INSERT INTO event_pity(user_id, event_id, counter)
+        VALUES (?, ?, 0)
+        ON CONFLICT(user_id, event_id)
+        DO UPDATE SET counter = 0
+    """, (user_id, event_id))
+
+
+async def roll_sploot(db: aiosqlite.Connection, user_id: int, event_id: int, cards: list,
+                       boosted_cards: dict, pity_threshold: int):
+    """
+    Tire une carte pour /sploot avec système de pity.
+
+    boosted_cards: dict {card_id: drop_rate_percent} — chaque carte boostée
+    est tirée indépendamment (rate direct entre 0.1 et 100). Si aucune ne
+    touche naturellement, on incrémente un compteur de pity propre à
+    l'event et au joueur. Une fois le compteur >= pity_threshold, la
+    prochaine tentative garantit une carte boostée (pondérée par les taux
+    respectifs de chaque carte boostée).
+
+    Retourne un tuple (card, pity_counter_after, pity_triggered: bool).
+    - Si une carte touche naturellement : compteur remis à 0, pity_triggered=False
+    - Si le pity se déclenche : compteur remis à 0, pity_triggered=True
+    - Sinon : compteur incrémenté, carte tirée via le pool classique par rareté
+    """
+    card_by_id = {c["id"]: c for c in cards}
+
+    async with db.execute(
+        "SELECT counter FROM event_pity WHERE user_id = ? AND event_id = ?",
+        (user_id, event_id)
+    ) as cursor:
+        row = await cursor.fetchone()
+    counter = row[0] if row else 0
+
+    # Tirage naturel indépendant par carte boostée
+    for card_id, rate_percent in boosted_cards.items():
+        if card_id not in card_by_id:
+            continue
+        if random.random() * 100 <= rate_percent:
+            await _reset_pity(db, user_id, event_id)
+            return card_by_id[card_id], 0, False
+
+    next_counter = counter + 1
+
+    # Pity garanti
+    if boosted_cards and next_counter >= pity_threshold:
+        ids = list(boosted_cards.keys())
+        weights = list(boosted_cards.values())
+        forced_id = random.choices(ids, weights=weights, k=1)[0]
+        await _reset_pity(db, user_id, event_id)
+        return card_by_id[forced_id], 0, True
+
+    # Échec : incrémente le pity, retombe sur le tirage classique
+    await db.execute("""
+        INSERT INTO event_pity(user_id, event_id, counter)
+        VALUES (?, ?, 1)
+        ON CONFLICT(user_id, event_id)
+        DO UPDATE SET counter = counter + 1
+    """, (user_id, event_id))
+    return get_loot(cards), next_counter, False
+
 
 def calculate_duel_winner(card1, card2):
     rounds = []
@@ -171,8 +250,12 @@ def calculate_duel_winner(card1, card2):
 @bot.event
 async def on_ready():
     global cards_cache
-    await bot.tree.sync()
-    print(f"Slash commands Synchronisées | {bot.user}")
+    synced = await bot.tree.sync()
+    print(f"{len(synced)} Slash commands Synchronisées | {bot.user}")
+
+    for command in bot.tree.get_commands():
+        print(f" - {command.name}")
+    
     async with aiosqlite.connect("db.sqlite") as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -184,7 +267,7 @@ async def on_ready():
         """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS cards (
-                id INT PRIMARY KEY AUTOINCREMENT,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT,
                 rarity TEXT,
                 image_url TEXT,
@@ -211,12 +294,39 @@ async def on_ready():
                 PRIMARY KEY (player1_id, player2_id)
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE,
+                start_time TEXT,
+                end_time TEXT,
+                created_by INT,
+                pity_threshold INT DEFAULT 15
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS event_cards (
+                event_id INT,
+                card_id INT,
+                multiplier REAL DEFAULT 1.0,
+                PRIMARY KEY (event_id, card_id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS event_pity (
+                user_id INT,
+                event_id INT,
+                counter INT DEFAULT 0,
+                PRIMARY KEY (user_id, event_id)
+            )
+        """)
         
         for alter in [
             "ALTER TABLE users ADD COLUMN loot_count INT DEFAULT 0",
             "ALTER TABLE users ADD COLUMN favorite_card INT",
             "ALTER TABLE cards ADD COLUMN power INT DEFAULT 1",
             "ALTER TABLE cards ADD COLUMN protection INT DEFAULT 1",
+            "ALTER TABLE events ADD COLUMN pity_threshold INT DEFAULT 15",
         ]:
             try:
                 await db.execute(alter)
@@ -283,7 +393,12 @@ async def help(interaction: discord.Interaction):
     player_commands = []
     admin_commands = []
 
-    ADMIN_COMMANDS = {"db", "refresh", "addcard", "delcard", "givecard", "status", "backup", "fixcardimage", "refreshallimages"}
+    ADMIN_COMMANDS = {
+        "db", "refresh", "addcard", "delcard", "givecard", "status", "backup",
+        "fixcardimage", "refreshallimages",
+        "eventcreate", "eventaddcard", "eventremovecard", "eventdelete", "eventlist",
+        "eventresetpity", "eventsetpity"
+    }
 
     for cmd in bot.tree.get_commands():
         cmd_name = cmd.name
@@ -329,6 +444,9 @@ async def loot(interaction: discord.Interaction):
                 return
 
         card = get_loot(cards_cache)
+        if card is None:
+            await interaction.response.send_message("📭 Aucune carte n'est encore disponible dans le jeu.", ephemeral=True)
+            return
 
         await db.execute(
             "INSERT OR REPLACE INTO users(user_id, last_loot, loot_count) VALUES (?, ?, COALESCE((SELECT loot_count FROM users WHERE user_id = ?), 0) + 1)",
@@ -352,6 +470,145 @@ async def loot(interaction: discord.Interaction):
     if is_booster:
         embed.set_footer(text="💎 Cooldown réduit grâce à ton boost du serveur !")
     await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="sploot", description="Loot spécial lié à un event en cours (avec pity)")
+@app_commands.describe(event="Nom de l'event (utilise l'autocomplétion)")
+async def sploot(interaction: discord.Interaction, event: str):
+    user_id = interaction.user.id
+    now = datetime.now(timezone.utc)
+
+    is_booster = interaction.user.premium_since is not None
+    cooldown_hours = BOOSTER_COOLDOWN_HOURS if is_booster else BASE_COOLDOWN_HOURS
+
+    async with aiosqlite.connect("db.sqlite") as db:
+        async with db.execute(
+            "SELECT id, name, end_time, pity_threshold FROM events WHERE LOWER(name) = LOWER(?)", (event,)
+        ) as cursor:
+            event_row = await cursor.fetchone()
+
+        if not event_row:
+            await interaction.response.send_message(f"❌ Event **{event}** introuvable", ephemeral=True)
+            return
+
+        event_id, event_name, end_time_str, pity_threshold = event_row
+        pity_threshold = pity_threshold or DEFAULT_PITY_THRESHOLD
+        end_time = datetime.fromisoformat(end_time_str)
+        if now >= end_time:
+            await interaction.response.send_message(f"❌ L'event **{event_name}** est terminé", ephemeral=True)
+            return
+
+        async with db.execute("SELECT last_loot FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+
+        if row and row[0]:
+            last_loot = datetime.fromisoformat(row[0])
+            if now - last_loot < timedelta(hours=cooldown_hours):
+                remaining = timedelta(hours=cooldown_hours) - (now - last_loot)
+                h, rem = divmod(int(remaining.total_seconds()), 3600)
+                m, s = divmod(rem, 60)
+                await interaction.response.send_message(f"⏳ Attends encore **{h}h {m}m {s}s**", ephemeral=True)
+                return
+
+        async with db.execute(
+            "SELECT card_id, multiplier FROM event_cards WHERE event_id = ?", (event_id,)
+        ) as cursor:
+            boost_rows = await cursor.fetchall()
+        boosts = {card_id: multiplier for card_id, multiplier in boost_rows}
+
+        if not cards_cache:
+            await interaction.response.send_message("📭 Aucune carte n'est encore disponible dans le jeu.", ephemeral=True)
+            return
+
+        card, pity_counter, pity_triggered = await roll_sploot(db, user_id, event_id, cards_cache, boosts, pity_threshold)
+
+        await db.execute(
+            "INSERT OR REPLACE INTO users(user_id, last_loot, loot_count) VALUES (?, ?, COALESCE((SELECT loot_count FROM users WHERE user_id = ?), 0) + 1)",
+            (user_id, now.isoformat(), user_id)
+        )
+        await db.execute("""
+            INSERT INTO user_cards(user_id, card_id, quantity)
+            VALUES (?, ?, 1)
+            ON CONFLICT(user_id, card_id)
+            DO UPDATE SET quantity = quantity + 1
+        """, (user_id, card["id"]))
+        await db.commit()
+
+    embed = discord.Embed(
+        title=card["name"],
+        description=f"**Rareté :** {card['rarity']}\n⚔️ **Power :** {card['power']}/6\n🛡️ **Protection :** {card['protection']}/6",
+        color=RARITY_COLORS.get(card["rarity"])
+    )
+    if card["image_url"]:
+        embed.set_image(url=card["image_url"])
+
+    footer_parts = [f"🎉 Loot spécial — event : {event_name}"]
+    if pity_triggered:
+        footer_parts.append("✨ Pity déclenché — carte boostée garantie !")
+    elif boosts:
+        footer_parts.append(f"🎯 Pity : {pity_counter}/{pity_threshold}")
+    if is_booster:
+        footer_parts.append("💎 Cooldown réduit grâce à ton boost du serveur !")
+    embed.set_footer(text=" | ".join(footer_parts))
+    await interaction.response.send_message(embed=embed)
+
+@sploot.autocomplete('event')
+async def sploot_event_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect("db.sqlite") as db:
+        async with db.execute(
+            "SELECT name, end_time FROM events WHERE end_time > ? ORDER BY name ASC", (now,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+    matches = [(n, e) for n, e in rows if current.lower() in n.lower()]
+    choices = []
+    for n, e in matches[:25]:
+        end_dt = datetime.fromisoformat(e)
+        remaining = end_dt - datetime.now(timezone.utc)
+        total_seconds = max(int(remaining.total_seconds()), 0)
+        h, rem = divmod(total_seconds, 3600)
+        m, _ = divmod(rem, 60)
+        choices.append(app_commands.Choice(name=f"{n} (finit dans {h}h{m:02d})", value=n))
+    return choices
+
+
+@bot.tree.command(name="eventpity", description="Voir ta progression de pity sur un event")
+@app_commands.describe(event="Nom de l'event (utilise l'autocomplétion)")
+async def eventpity(interaction: discord.Interaction, event: str):
+    user_id = interaction.user.id
+    async with aiosqlite.connect("db.sqlite") as db:
+        async with db.execute(
+            "SELECT id, name, end_time, pity_threshold FROM events WHERE LOWER(name) = LOWER(?)", (event,)
+        ) as cursor:
+            event_row = await cursor.fetchone()
+        if not event_row:
+            await interaction.response.send_message(f"❌ Event **{event}** introuvable", ephemeral=True)
+            return
+        event_id, event_name, end_time_str, pity_threshold = event_row
+        pity_threshold = pity_threshold or DEFAULT_PITY_THRESHOLD
+
+        async with db.execute(
+            "SELECT counter FROM event_pity WHERE user_id = ? AND event_id = ?", (user_id, event_id)
+        ) as cursor:
+            row = await cursor.fetchone()
+        counter = row[0] if row else 0
+
+    remaining = max(pity_threshold - counter, 0)
+    await interaction.response.send_message(
+        f"🎯 **{event_name}** — Pity : **{counter}/{pity_threshold}**\n"
+        f"Encore **{remaining}** sploot(s) sans carte boostée avant garantie.",
+        ephemeral=True
+    )
+
+@eventpity.autocomplete('event')
+async def eventpity_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect("db.sqlite") as db:
+        async with db.execute(
+            "SELECT name, end_time FROM events WHERE end_time > ? ORDER BY name ASC", (now,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+    matches = [n for n, e in rows if current.lower() in n.lower()]
+    return [app_commands.Choice(name=n, value=n) for n in matches[:25]]
 
 
 @bot.tree.command(name="show", description="Afficher une carte de ton inventaire")
@@ -1078,6 +1335,7 @@ async def delcard(interaction: discord.Interaction, name: str):
             return
         card_id, rarity = card
         await db.execute("DELETE FROM user_cards WHERE card_id = ?", (card_id,))
+        await db.execute("DELETE FROM event_cards WHERE card_id = ?", (card_id,))
         await db.execute("DELETE FROM cards WHERE id = ?", (card_id,))
         await db.commit()
 
@@ -1124,6 +1382,294 @@ async def givecard_autocomplete(interaction: discord.Interaction, current: str) 
             rows = await cursor.fetchall()
     matches = [(n, r) for n, r in rows if current.lower() in n.lower()]
     return [app_commands.Choice(name=f"{n} ({r})", value=n) for n, r in matches[:25]]
+
+@bot.tree.command(name="eventcreate", description="Créer un nouvel event de loot spécial avec pity")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(
+    name="Nom de l'event",
+    duration_hours="Durée de l'event en heures (ex: 24 pour 1 jour)",
+    pity_threshold="Nombre de sploots ratés avant garantie d'une carte boostée (défaut: 15)"
+)
+async def eventcreate(interaction: discord.Interaction, name: str, duration_hours: float, pity_threshold: int = DEFAULT_PITY_THRESHOLD):
+    if duration_hours <= 0:
+        await interaction.response.send_message("❌ La durée doit être positive", ephemeral=True)
+        return
+    if pity_threshold <= 0:
+        await interaction.response.send_message("❌ Le seuil de pity doit être positif", ephemeral=True)
+        return
+
+    now = datetime.now(timezone.utc)
+    end_time = now + timedelta(hours=duration_hours)
+
+    async with aiosqlite.connect("db.sqlite") as db:
+        async with db.execute("SELECT id FROM events WHERE LOWER(name) = LOWER(?)", (name,)) as cursor:
+            existing = await cursor.fetchone()
+        if existing:
+            await interaction.response.send_message(f"❌ Un event nommé **{name}** existe déjà", ephemeral=True)
+            return
+
+        await db.execute(
+            "INSERT INTO events(name, start_time, end_time, created_by, pity_threshold) VALUES (?, ?, ?, ?, ?)",
+            (name, now.isoformat(), end_time.isoformat(), interaction.user.id, pity_threshold)
+        )
+        await db.commit()
+
+    await interaction.response.send_message(
+        f"🎉 Event **{name}** créé ! Il se termine <t:{int(end_time.timestamp())}:R>.\n"
+        f"🎯 Pity fixé à **{pity_threshold}** sploots ratés.\n"
+        f"Utilise `/eventaddcard` pour y ajouter des cartes boostées.",
+        ephemeral=True
+    )
+
+eventcreate.error(admin_error)
+
+
+@bot.tree.command(name="eventsetpity", description="Modifier le seuil de pity d'un event existant")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(
+    event_name="Nom de l'event (utilise l'autocomplétion)",
+    pity_threshold="Nouveau seuil de pity (nombre de sploots ratés avant garantie)"
+)
+async def eventsetpity(interaction: discord.Interaction, event_name: str, pity_threshold: int):
+    if pity_threshold <= 0:
+        await interaction.response.send_message("❌ Le seuil de pity doit être positif", ephemeral=True)
+        return
+
+    async with aiosqlite.connect("db.sqlite") as db:
+        async with db.execute("SELECT id FROM events WHERE LOWER(name) = LOWER(?)", (event_name,)) as cursor:
+            event_row = await cursor.fetchone()
+        if not event_row:
+            await interaction.response.send_message(f"❌ Event **{event_name}** introuvable", ephemeral=True)
+            return
+        await db.execute("UPDATE events SET pity_threshold = ? WHERE id = ?", (pity_threshold, event_row[0]))
+        await db.commit()
+
+    await interaction.response.send_message(f"✅ Pity de l'event **{event_name}** fixé à **{pity_threshold}**", ephemeral=True)
+
+eventsetpity.error(admin_error)
+
+@eventsetpity.autocomplete('event_name')
+async def eventsetpity_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    async with aiosqlite.connect("db.sqlite") as db:
+        async with db.execute("SELECT name FROM events ORDER BY name ASC") as cursor:
+            rows = await cursor.fetchall()
+    matches = [n for (n,) in rows if current.lower() in n.lower()]
+    return [app_commands.Choice(name=n, value=n) for n in matches[:25]]
+
+
+@bot.tree.command(name="eventaddcard", description="Ajouter ou modifier une carte boostée dans un event")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(
+    event_name="Nom de l'event (utilise l'autocomplétion)",
+    card_name="Nom de la carte (utilise l'autocomplétion)",
+    drop_rate="Taux de drop direct en % (entre 0.1 et 100)"
+)
+async def eventaddcard(interaction: discord.Interaction, event_name: str, card_name: str, drop_rate: float):
+    if not (0.1 <= drop_rate <= 100):
+        await interaction.response.send_message("❌ Le taux de drop doit être entre 0.1 et 100", ephemeral=True)
+        return
+
+    async with aiosqlite.connect("db.sqlite") as db:
+        async with db.execute("SELECT id FROM events WHERE LOWER(name) = LOWER(?)", (event_name,)) as cursor:
+            event_row = await cursor.fetchone()
+        if not event_row:
+            await interaction.response.send_message(f"❌ Event **{event_name}** introuvable", ephemeral=True)
+            return
+        event_id = event_row[0]
+
+        async with db.execute("SELECT id, name, rarity FROM cards WHERE LOWER(name) = LOWER(?)", (card_name,)) as cursor:
+            card_row = await cursor.fetchone()
+        if not card_row:
+            await interaction.response.send_message(f"❌ Carte **{card_name}** introuvable", ephemeral=True)
+            return
+        card_id, actual_name, rarity = card_row
+
+        await db.execute("""
+            INSERT INTO event_cards(event_id, card_id, multiplier)
+            VALUES (?, ?, ?)
+            ON CONFLICT(event_id, card_id)
+            DO UPDATE SET multiplier = excluded.multiplier
+        """, (event_id, card_id, drop_rate))
+        await db.commit()
+
+    await interaction.response.send_message(
+        f"✅ **{actual_name}** ({rarity}) aura un taux de drop de **{drop_rate}%** dans l'event **{event_name}**\n"
+        f"(en plus du pity qui garantit une carte boostée après plusieurs échecs)",
+        ephemeral=True
+    )
+
+eventaddcard.error(admin_error)
+
+@eventaddcard.autocomplete('event_name')
+async def eventaddcard_event_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    async with aiosqlite.connect("db.sqlite") as db:
+        async with db.execute("SELECT name FROM events ORDER BY name ASC") as cursor:
+            rows = await cursor.fetchall()
+    matches = [n for (n,) in rows if current.lower() in n.lower()]
+    return [app_commands.Choice(name=n, value=n) for n in matches[:25]]
+
+@eventaddcard.autocomplete('card_name')
+async def eventaddcard_card_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    matches = [c for c in cards_cache if current.lower() in c["name"].lower()]
+    return [app_commands.Choice(name=f"{c['name']} ({c['rarity']})", value=c["name"]) for c in matches[:25]]
+
+
+@bot.tree.command(name="eventremovecard", description="Retirer une carte boostée d'un event")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(
+    event_name="Nom de l'event (utilise l'autocomplétion)",
+    card_name="Nom de la carte à retirer (utilise l'autocomplétion)"
+)
+async def eventremovecard(interaction: discord.Interaction, event_name: str, card_name: str):
+    async with aiosqlite.connect("db.sqlite") as db:
+        async with db.execute("SELECT id FROM events WHERE LOWER(name) = LOWER(?)", (event_name,)) as cursor:
+            event_row = await cursor.fetchone()
+        if not event_row:
+            await interaction.response.send_message(f"❌ Event **{event_name}** introuvable", ephemeral=True)
+            return
+        event_id = event_row[0]
+
+        async with db.execute("SELECT id, name FROM cards WHERE LOWER(name) = LOWER(?)", (card_name,)) as cursor:
+            card_row = await cursor.fetchone()
+        if not card_row:
+            await interaction.response.send_message(f"❌ Carte **{card_name}** introuvable", ephemeral=True)
+            return
+        card_id, actual_name = card_row
+
+        await db.execute("DELETE FROM event_cards WHERE event_id = ? AND card_id = ?", (event_id, card_id))
+        await db.commit()
+
+    await interaction.response.send_message(f"✅ **{actual_name}** retirée de l'event **{event_name}**", ephemeral=True)
+
+eventremovecard.error(admin_error)
+
+@eventremovecard.autocomplete('event_name')
+async def eventremovecard_event_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    async with aiosqlite.connect("db.sqlite") as db:
+        async with db.execute("SELECT name FROM events ORDER BY name ASC") as cursor:
+            rows = await cursor.fetchall()
+    matches = [n for (n,) in rows if current.lower() in n.lower()]
+    return [app_commands.Choice(name=n, value=n) for n in matches[:25]]
+
+@eventremovecard.autocomplete('card_name')
+async def eventremovecard_card_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    event_name = getattr(interaction.namespace, 'event_name', None)
+    if not event_name:
+        return [app_commands.Choice(name="Sélectionne d'abord un event", value="")]
+    async with aiosqlite.connect("db.sqlite") as db:
+        async with db.execute("SELECT id FROM events WHERE LOWER(name) = LOWER(?)", (event_name,)) as cursor:
+            event_row = await cursor.fetchone()
+        if not event_row:
+            return []
+        async with db.execute(
+            "SELECT c.name, c.rarity, ec.multiplier FROM event_cards ec JOIN cards c ON ec.card_id = c.id WHERE ec.event_id = ? ORDER BY c.name ASC",
+            (event_row[0],)
+        ) as cursor:
+            rows = await cursor.fetchall()
+    matches = [(n, r, m) for n, r, m in rows if current.lower() in n.lower()]
+    return [app_commands.Choice(name=f"{n} ({r}) {m}%", value=n) for n, r, m in matches[:25]]
+
+
+@bot.tree.command(name="eventdelete", description="Supprimer un event de loot spécial")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(event_name="Nom de l'event à supprimer (utilise l'autocomplétion)")
+async def eventdelete(interaction: discord.Interaction, event_name: str):
+    async with aiosqlite.connect("db.sqlite") as db:
+        async with db.execute("SELECT id FROM events WHERE LOWER(name) = LOWER(?)", (event_name,)) as cursor:
+            event_row = await cursor.fetchone()
+        if not event_row:
+            await interaction.response.send_message(f"❌ Event **{event_name}** introuvable", ephemeral=True)
+            return
+        event_id = event_row[0]
+        await db.execute("DELETE FROM event_cards WHERE event_id = ?", (event_id,))
+        await db.execute("DELETE FROM event_pity WHERE event_id = ?", (event_id,))
+        await db.execute("DELETE FROM events WHERE id = ?", (event_id,))
+        await db.commit()
+
+    await interaction.response.send_message(f"🗑️ Event **{event_name}** supprimé", ephemeral=True)
+
+eventdelete.error(admin_error)
+
+@eventdelete.autocomplete('event_name')
+async def eventdelete_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    async with aiosqlite.connect("db.sqlite") as db:
+        async with db.execute("SELECT name FROM events ORDER BY name ASC") as cursor:
+            rows = await cursor.fetchall()
+    matches = [n for (n,) in rows if current.lower() in n.lower()]
+    return [app_commands.Choice(name=n, value=n) for n in matches[:25]]
+
+
+@bot.tree.command(name="eventresetpity", description="Réinitialiser le pity d'un joueur sur un event")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(
+    event_name="Nom de l'event (utilise l'autocomplétion)",
+    member="Joueur dont le pity doit être réinitialisé"
+)
+async def eventresetpity(interaction: discord.Interaction, event_name: str, member: discord.Member):
+    async with aiosqlite.connect("db.sqlite") as db:
+        async with db.execute("SELECT id FROM events WHERE LOWER(name) = LOWER(?)", (event_name,)) as cursor:
+            event_row = await cursor.fetchone()
+        if not event_row:
+            await interaction.response.send_message(f"❌ Event **{event_name}** introuvable", ephemeral=True)
+            return
+        await _reset_pity(db, member.id, event_row[0])
+        await db.commit()
+
+    await interaction.response.send_message(f"✅ Pity de **{member.display_name}** réinitialisé pour l'event **{event_name}**", ephemeral=True)
+
+eventresetpity.error(admin_error)
+
+@eventresetpity.autocomplete('event_name')
+async def eventresetpity_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    async with aiosqlite.connect("db.sqlite") as db:
+        async with db.execute("SELECT name FROM events ORDER BY name ASC") as cursor:
+            rows = await cursor.fetchall()
+    matches = [n for (n,) in rows if current.lower() in n.lower()]
+    return [app_commands.Choice(name=n, value=n) for n in matches[:25]]
+
+
+@bot.tree.command(name="eventlist", description="Voir tous les events (actifs et terminés) et leurs cartes boostées")
+@app_commands.checks.has_permissions(administrator=True)
+async def eventlist(interaction: discord.Interaction):
+    now = datetime.now(timezone.utc)
+
+    async with aiosqlite.connect("db.sqlite") as db:
+        async with db.execute("SELECT id, name, end_time, pity_threshold FROM events ORDER BY end_time DESC") as cursor:
+            events = await cursor.fetchall()
+
+        if not events:
+            await interaction.response.send_message("📭 Aucun event créé pour l'instant.", ephemeral=True)
+            return
+
+        embed = discord.Embed(title="🎉 Events de loot spécial", color=0x9b59b6, timestamp=now)
+
+        for event_id, name, end_time_str, pity_threshold in events:
+            pity_threshold = pity_threshold or DEFAULT_PITY_THRESHOLD
+            end_time = datetime.fromisoformat(end_time_str)
+            status_text = "🟢 Actif" if end_time > now else "🔴 Terminé"
+
+            async with db.execute(
+                "SELECT c.name, c.rarity, ec.multiplier FROM event_cards ec JOIN cards c ON ec.card_id = c.id WHERE ec.event_id = ? ORDER BY c.name ASC",
+                (event_id,)
+            ) as cursor:
+                boosted = await cursor.fetchall()
+
+            if boosted:
+                cards_text = "\n".join(f"• {n} ({r}) {m}%" for n, r, m in boosted)
+            else:
+                cards_text = "*Aucune carte boostée*"
+            cards_text += f"\n🎯 Pity : garantie après **{pity_threshold}** échecs"
+
+            embed.add_field(
+                name=f"{status_text} — {name} (finit <t:{int(end_time.timestamp())}:R>)",
+                value=cards_text,
+                inline=False
+            )
+
+    embed.set_footer(text=f"Demandé par {interaction.user.display_name}")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+eventlist.error(admin_error)
 
 
 @bot.tree.command(name="backup", description="Créer une sauvegarde de la base de données")
