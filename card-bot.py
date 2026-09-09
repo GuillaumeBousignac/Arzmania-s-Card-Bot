@@ -16,7 +16,7 @@ load_dotenv()
 
 start_time = datetime.now(timezone.utc)
 
-BOT_VERSION = "1.2.0"
+BOT_VERSION = "1.2.1"
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
@@ -448,10 +448,12 @@ async def loot(interaction: discord.Interaction):
             await interaction.response.send_message("📭 Aucune carte n'est encore disponible dans le jeu.", ephemeral=True)
             return
 
-        await db.execute(
-            "INSERT OR REPLACE INTO users(user_id, last_loot, loot_count) VALUES (?, ?, COALESCE((SELECT loot_count FROM users WHERE user_id = ?), 0) + 1)",
-            (user_id, now.isoformat(), user_id)
-        )
+        await db.execute("""
+            INSERT INTO users(user_id, last_loot, loot_count)
+            VALUES (?, ?, 1)
+            ON CONFLICT(user_id)
+            DO UPDATE SET last_loot = excluded.last_loot, loot_count = loot_count + 1
+        """, (user_id, now.isoformat()))
         await db.execute("""
             INSERT INTO user_cards(user_id, card_id, quantity)
             VALUES (?, ?, 1)
@@ -521,10 +523,12 @@ async def sploot(interaction: discord.Interaction, event: str):
 
         card, pity_counter, pity_triggered = await roll_sploot(db, user_id, event_id, cards_cache, boosts, pity_threshold)
 
-        await db.execute(
-            "INSERT OR REPLACE INTO users(user_id, last_loot, loot_count) VALUES (?, ?, COALESCE((SELECT loot_count FROM users WHERE user_id = ?), 0) + 1)",
-            (user_id, now.isoformat(), user_id)
-        )
+        await db.execute("""
+            INSERT INTO users(user_id, last_loot, loot_count)
+            VALUES (?, ?, 1)
+            ON CONFLICT(user_id)
+            DO UPDATE SET last_loot = excluded.last_loot, loot_count = loot_count + 1
+        """, (user_id, now.isoformat()))
         await db.execute("""
             INSERT INTO user_cards(user_id, card_id, quantity)
             VALUES (?, ?, 1)
@@ -810,8 +814,11 @@ async def fav(interaction: discord.Interaction, card_name: str):
             await interaction.response.send_message("❌ Tu ne possèdes pas cette carte", ephemeral=True)
             return
         card_id, actual_name, rarity = card_row
-        await db.execute("UPDATE users SET favorite_card = ? WHERE user_id = ?", (card_id, user_id))
-        await db.execute("INSERT OR IGNORE INTO users(user_id, favorite_card) VALUES (?, ?)", (user_id, card_id))
+        await db.execute("""
+            INSERT INTO users(user_id, favorite_card)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET favorite_card = excluded.favorite_card
+        """, (user_id, card_id))
         await db.commit()
     await interaction.response.send_message(f"⭐ **{actual_name}** ({rarity}) est maintenant ta carte favorite !")
 
